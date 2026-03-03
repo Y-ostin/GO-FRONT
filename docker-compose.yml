@@ -1,0 +1,30 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# GO-FRONT — Standalone Docker Compose
+#
+# Corre de forma independiente al GO-SERVICE.
+# Los requests de API y MQTT los hace el BROWSER directamente:
+#   - API REST  → http://localhost:8090  (go-service corriendo en el host)
+#   - MQTT WSS  → EMQX Cloud (acceso directo desde el browser)
+#
+# Uso:
+#   docker-compose up --build          # primera vez o tras cambios
+#   docker-compose up -d               # levantar en background
+#   docker-compose down                # parar y eliminar contenedor
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  go-front:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # URL de la API: el browser la llama desde el host, no desde Docker
+        VITE_API_URL: http://localhost:8090
+        # EMQX Cloud WebSocket TLS — el browser conecta directo al broker
+        VITE_MQTT_URL: wss://s9a612f1.ala.eu-central-1.emqxsl.com:8084/mqtt
+        VITE_MQTT_USER: ccip-admin
+        VITE_MQTT_PASS: "12345678"
+    container_name: ccip_go_front
+    restart: unless-stopped
+    ports:
+      - "4173:80"   # acceder en http://localhost:4173
