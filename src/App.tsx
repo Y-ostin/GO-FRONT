@@ -1,296 +1,306 @@
-import { useEffect, useRef, useState } from 'react';
-import mqtt, { type MqttClient } from 'mqtt';
-import { dashboardApi, type KpiResponse, type BreakdownSlice, type Period } from './api/dashboard';
+import { useDashboard, MONTHS, fmt, fmtPct, varBadge } from './hooks/useDashboard';
+import { useMqtt } from './hooks/useMqtt';
+import { KpiTopCard } from './components/KpiTopCard';
+import { MqttBadge } from './components/MqttBadge';
+import { PeriodSelector } from './components/PeriodSelector';
 import { EChartDonut } from './components/EChartPie';
+import { TrendChart } from './components/TrendChart';
+import type { KpiResponse } from './api/dashboard';
 import './index.css';
-
-// ── Helpers ────────────────────────────────────────────────────────────────
-const MONTHS = ['','Enero','Febrero','Marzo','Abril','Mayo','Junio',
-  'Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
-
-function fmt(n: number | null | undefined): string {
-  if (n == null || isNaN(Number(n))) return 'S/ 0.00';
-  return 'S/ ' + Number(n).toLocaleString('es-PE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
-function fmtPct(n: number | null | undefined): string {
-  if (n == null || isNaN(Number(n))) return '0.0%';
-  return Number(n).toFixed(1) + '%';
-}
-function varBadge(variacion: number, anterior: number, invertSign = false): { text: string; cls: string } {
-  if (!anterior || anterior === 0) return { text: '—', cls: 'text-slate-500' };
-  const isGood = invertSign ? variacion <= 0 : variacion >= 0;
-  const arrow  = variacion >= 0 ? '▲' : '▼';
-  return {
-    text: `${arrow} ${Math.abs(variacion).toFixed(1)}%`,
-    cls: isGood ? 'text-emerald-400' : 'text-rose-400',
-  };
-}
-
-// ── Estado vacío por defecto ───────────────────────────────────────────────
-const EMPTY_KPI: KpiResponse = {
-  year: 0, month: 0,
-  ingresos_actual: 0, ingresos_anterior: 0, ingresos_variacion: 0,
-  egresos_actual:  0, egresos_anterior:  0, egresos_variacion:  0,
-};
-
-type MqttState = 'connecting' | 'connected' | 'error';
 
 // ── Componente principal ───────────────────────────────────────────────────
 export default function App() {
-  const [kpi,         setKpi]         = useState<KpiResponse>(EMPTY_KPI);
-  const [ingresos,    setIngresos]    = useState<BreakdownSlice[]>([]);
-  const [egresos,     setEgresos]     = useState<BreakdownSlice[]>([]);
-  const [years,       setYears]       = useState<number[]>([]);
-  const [selYear,     setSelYear]     = useState<number>(new Date().getFullYear());
-  const [selMonth,    setSelMonth]    = useState<number>(new Date().getMonth() + 1);
-  const [mqttState,   setMqttState]   = useState<MqttState>('connecting');
-  const [mqttMsg,     setMqttMsg]     = useState('');
-  const [mqttCount,   setMqttCount]   = useState(0);
-  const [lastUpdate,  setLastUpdate]  = useState('—');
-  const clientRef = useRef<MqttClient | null>(null);
-  // Refs para acceder al estado actual dentro del closure MQTT sin re-crear
-  const yearRef  = useRef(selYear);
-  const monthRef = useRef(selMonth);
-  yearRef.current  = selYear;
-  monthRef.current = selMonth;
+  const {
+    kpi, setKpi,
+    ingresos, egresos,
+    trend,
+    years, selYear, selMonth,
+    lastUpdate, setLastUpdate,
+    yearRef, monthRef,
+    setSelYear, setSelMonth,
+    loadAll,
+  } = useDashboard();
 
-  // ── Carga datos KPI + Breakdown ──────────────────────────────────────────
-  const loadAll = (year: number, month: number) => {
-    dashboardApi.getKPIs(year, month)
-      .then(r => { setKpi(r.data); setLastUpdate(new Date().toLocaleTimeString('es-PE')); })
-      .catch(e => console.error('/api/kpis', e));
-
-    dashboardApi.getBreakdown(year, month)
-      .then(r => { setIngresos(r.data.ingresos ?? []); setEgresos(r.data.egresos ?? []); })
-      .catch(e => console.error('/api/kpis/breakdown', e));
+  // ── Callback MQTT: actualiza datos cuando llega un mensaje ───────────────
+  const handleMqttMessage = (raw: string) => {
+    try {
+      const data = JSON.parse(raw) as KpiResponse;
+      if (yearRef.current === 0) { loadAll(0, 0); return; }
+      if (monthRef.current === 0 && data.year === yearRef.current) {
+        loadAll(yearRef.current, 0); return;
+      }
+      if (data.year === yearRef.current && data.month === monthRef.current) {
+        setKpi(data);
+        setLastUpdate(new Date().toLocaleTimeString('es-PE'));
+      }
+    } catch { /* payload no válido, ignorar */ }
   };
 
-  // ── Cargar períodos disponibles al montar ────────────────────────────────
-  useEffect(() => {
-    dashboardApi.getPeriods().then(r => {
-      const data: Period[] = r.data ?? [];
-      const uniqueYears = [...new Set(data.map(p => p.year))].sort((a, b) => b - a);
-      setYears(uniqueYears);
-
-      const nowYear  = new Date().getFullYear();
-      const nowMonth = new Date().getMonth() + 1;
-      const initYear = uniqueYears.includes(nowYear) ? nowYear : (uniqueYears[0] ?? nowYear);
-      setSelYear(initYear);
-      setSelMonth(nowMonth);
-      loadAll(initYear, nowMonth);
-    }).catch(() => loadAll(selYear, selMonth));
-  }, []);
-
-  // ── Recargar al cambiar filtros ──────────────────────────────────────────
-  useEffect(() => { loadAll(selYear, selMonth); }, [selYear, selMonth]);
-
-  // ── MQTT ─────────────────────────────────────────────────────────────────
-  useEffect(() => {
-    const url  = import.meta.env.VITE_MQTT_URL  || 'wss://s9a612f1.ala.eu-central-1.emqxsl.com:8084/mqtt';
-    const user = import.meta.env.VITE_MQTT_USER || 'ccip-admin';
-    const pass = import.meta.env.VITE_MQTT_PASS || '12345678';
-
-    const client = mqtt.connect(url, {
-      clientId: 'ccip-dash-' + Math.random().toString(36).substring(2, 10),
-      username: user, password: pass,
-      clean: true, reconnectPeriod: 5000,
-      rejectUnauthorized: false,
-    });
-    clientRef.current = client;
-
-    client.on('connect',   () => { setMqttState('connected'); client.subscribe('ccip/dashboard'); });
-    client.on('reconnect', () => setMqttState('connecting'));
-    client.on('close',     () => { setMqttState('error'); setMqttMsg('Desconectado'); });
-    client.on('error',     (e) => { setMqttState('error'); setMqttMsg(e.message.substring(0, 30)); });
-    client.on('message',   (_t, payload) => {
-      try {
-        const data = JSON.parse(payload.toString()) as KpiResponse;
-        setMqttCount(c => c + 1);
-        if (yearRef.current === 0) { loadAll(0, 0); return; }
-        if (monthRef.current === 0 && data.year === yearRef.current) { loadAll(yearRef.current, 0); return; }
-        if (data.year === yearRef.current && data.month === monthRef.current) {
-          setKpi(data);
-          setLastUpdate(new Date().toLocaleTimeString('es-PE'));
-        }
-      } catch { /* skip parse errors */ }
-    });
-
-    return () => { client.end(); };
-  }, []);
+  const { mqttState, mqttMsg, mqttCount } = useMqtt({
+    topic:     'ccip/dashboard',
+    onMessage: handleMqttMessage,
+  });
 
   // ── Valores derivados ────────────────────────────────────────────────────
   const resultado       = (kpi.ingresos_actual || 0) - (kpi.egresos_actual || 0);
   const margen          = kpi.ingresos_actual > 0 ? (resultado / kpi.ingresos_actual) * 100 : 0;
-  const ratio           = kpi.ingresos_actual > 0 ? (kpi.egresos_actual  / kpi.ingresos_actual) * 100 : 0;
-  const barResultadoPct = kpi.ingresos_actual > 0 ? Math.min((kpi.egresos_actual / kpi.ingresos_actual) * 100, 100) : 50;
-
-  const isTodos  = selYear === 0;
-  const isYearly = selYear > 0 && selMonth === 0;
-  const vsLabel  = isTodos ? 'acumulado total' : isYearly ? 'vs año anterior' : 'vs mes anterior';
-  const periodoStr = isTodos  ? 'Todos los períodos · resumen general'
+  const ratio           = kpi.ingresos_actual > 0 ? (kpi.egresos_actual / kpi.ingresos_actual) * 100 : 0;
+  const isTodos    = selYear === 0;
+  const isYearly   = selYear > 0 && selMonth === 0;
+  const periodoStr = isTodos   ? 'Todos los períodos · resumen general'
     : isYearly ? `Año ${selYear} · resumen anual`
     : `${MONTHS[selMonth]} ${selYear}`;
 
   const ingV = varBadge(kpi.ingresos_variacion, kpi.ingresos_anterior, false);
   const egV  = varBadge(kpi.egresos_variacion,  kpi.egresos_anterior,  true);
 
-  // MQTT dot/label classes
-  const dotCls  = mqttState === 'connected'  ? 'w-2 h-2 rounded-full bg-emerald-400 inline-block dot-pulse'
-    : mqttState === 'connecting' ? 'w-2 h-2 rounded-full bg-amber-400 inline-block dot-pulse'
-    :                               'w-2 h-2 rounded-full bg-rose-500 inline-block';
-  const lblCls  = mqttState === 'connected'  ? 'text-emerald-400 text-xs'
-    : mqttState === 'connecting' ? 'text-amber-400 text-xs'
-    :                               'text-rose-400 text-xs';
-  const lblText = mqttState === 'connected'  ? 'MQTT activo'
-    : mqttState === 'connecting' ? 'Conectando…'
-    : (mqttMsg || 'Error MQTT');
+  const ratioCls        = ratio  <= 80  ? 'text-emerald-400' : ratio <= 100 ? 'text-amber-400' : 'text-rose-400';
+  const ratioLabel      = ratio  <= 80  ? '✓ Eficiencia saludable' : ratio <= 100 ? '⚠ Atención requerida' : '✗ Gastos superan ingresos';
 
-  // Barra ternary helpers
-  const resultadoBarCls = barResultadoPct <= 80 ? 'bg-emerald-500' : barResultadoPct <= 100 ? 'bg-amber-500' : 'bg-rose-500';
-  const margenBarCls    = margen >= 20 ? 'bg-emerald-500' : margen >= 0 ? 'bg-amber-500' : 'bg-rose-500';
-  const ratioBarCls     = ratio  <= 80 ? 'bg-emerald-500' : ratio  <= 100 ? 'bg-amber-500' : 'bg-rose-500';
+  // Punto de equilibrio: ingresos necesarios para cubrir egresos exactamente
+  const breakeven = kpi.egresos_actual > 0 ? kpi.egresos_actual : 0;
+  const breakevenReached = kpi.ingresos_actual >= breakeven;
+  // Top gasto: el mayor slice de egresos (primero del breakdown)
+  const topGasto = egresos[0];
 
   return (
-    <div className="min-h-screen p-4 md:p-6">
+    <div className="min-h-screen p-4 md:p-5">
 
-      {/* ── HEADER ── */}
-      <header className="flex flex-wrap items-center justify-between gap-4 mb-6">
-        <div>
-          <h1 className="text-2xl font-bold text-white tracking-tight">CCIP · Dashboard Financiero</h1>
-          <p className="text-sm text-slate-400 mt-0.5">Métricas ejecutivas mensuales · tiempo real vía MQTT</p>
+      {/* ══ HEADER ══════════════════════════════════════════════════════════ */}
+      <header className="flex flex-wrap items-center justify-between gap-3 mb-5">
+        <div className="flex items-center gap-3">
+          {/* Logo placeholder */}
+          <div className="w-9 h-9 rounded-lg bg-[#252840] border border-[#334155] flex items-center justify-center text-slate-400 text-xs font-bold">
+            CC
+          </div>
+          <div>
+            <h1 className="text-lg font-bold text-white tracking-tight leading-tight">
+              Dashboard Ejecutivo · Resultados Financieros
+            </h1>
+            <p className="text-xs text-slate-500">{periodoStr}</p>
+          </div>
         </div>
         <div className="flex items-center gap-3 flex-wrap">
-          {/* Selector año */}
-          <select
-            value={selYear}
-            onChange={e => { setSelYear(Number(e.target.value)); setSelMonth(0); }}
-            className="rounded-lg px-3 py-2 text-sm min-w-[110px] bg-[#0f1117] border border-[#252840] text-slate-200 focus:outline-none focus:border-[#4f6ef7] cursor-pointer"
-          >
-            <option value={0}>— Todos —</option>
-            {years.map(y => <option key={y} value={y}>{y}</option>)}
-          </select>
-          {/* Selector mes */}
-          <select
-            value={selMonth}
-            onChange={e => setSelMonth(Number(e.target.value))}
-            className="rounded-lg px-3 py-2 text-sm min-w-[130px] bg-[#0f1117] border border-[#252840] text-slate-200 focus:outline-none focus:border-[#4f6ef7] cursor-pointer"
-          >
-            <option value={0}>Todo el año</option>
-            {MONTHS.slice(1).map((m, i) => <option key={i + 1} value={i + 1}>{m}</option>)}
-          </select>
-          {/* Estado MQTT */}
-          <div className="flex items-center gap-1.5 text-xs">
-            <span className={dotCls} />
-            <span className={lblCls}>{lblText}</span>
-          </div>
+          {/* Fecha de actualización */}
+          <span className="text-xs bg-[#252840] border border-[#334155] rounded-lg px-3 py-1.5 text-slate-300">
+            Data actualizada · {lastUpdate}
+          </span>
+          <PeriodSelector
+            years={years}
+            selYear={selYear}
+            selMonth={selMonth}
+            onYearChange={y => { setSelYear(y); setSelMonth(0); }}
+            onMonthChange={setSelMonth}
+          />
+          <MqttBadge state={mqttState} msg={mqttMsg} />
         </div>
       </header>
 
-      {/* ── FILA 1: Ingresos / Egresos ── */}
-      <section className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
+      {/* ══ FILA 1: 4 KPI TOP CARDS ═════════════════════════════════════════ */}
+      <section className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3 mb-4">
+
         {/* Ingresos */}
-        <div id="cardIngresos" className="card rounded-2xl p-5">
-          <p className="text-xs text-slate-400 uppercase tracking-widest mb-1">Ingresos del mes</p>
-          <p className="text-3xl font-bold text-emerald-400">{fmt(kpi.ingresos_actual)}</p>
-          <div className="flex items-center gap-2 mt-2">
-            <span className={`text-sm font-bold ${ingV.cls}`}>{ingV.text}</span>
-            <span className="text-xs text-slate-500">
-              {vsLabel} (<span className="text-slate-400">{isTodos ? 'total' : fmt(kpi.ingresos_anterior)}</span>)
+        <KpiTopCard
+          title="Ingresos mensuales (SOLES)"
+          actual={fmt(kpi.ingresos_actual)}
+          anterior={isTodos ? 'acumulado' : fmt(kpi.ingresos_anterior)}
+          actualLabel="Mes actual (S./)"
+          anteriorLabel={isTodos ? 'Total histórico' : isYearly ? 'Año anterior' : 'Mes anterior'}
+          badge={ingV}
+          valueCls="text-emerald-400"
+        />
+
+        {/* Gastos */}
+        <KpiTopCard
+          title="Gastos mensuales (SOLES)"
+          actual={fmt(kpi.egresos_actual)}
+          anterior={isTodos ? 'acumulado' : fmt(kpi.egresos_anterior)}
+          actualLabel="Mes actual (S./)"
+          anteriorLabel={isTodos ? 'Total histórico' : isYearly ? 'Año anterior' : 'Mes anterior'}
+          badge={egV}
+          valueCls="text-rose-400"
+        />
+
+        {/* Resultado */}
+        <KpiTopCard
+          title="Resultado (SOLES)"
+          actual={fmt(resultado)}
+          anterior={fmt(kpi.ingresos_anterior - kpi.egresos_anterior)}
+          actualLabel="Mes actual (S./)"
+          anteriorLabel={isYearly ? 'Año anterior' : 'Mes anterior'}
+          badge={resultado >= 0
+            ? { text: resultado >= 0 ? '✓ Superávit' : '⚠ Déficit', cls: 'text-emerald-400' }
+            : { text: '⚠ Déficit', cls: 'text-rose-400' }
+          }
+          valueCls={resultado >= 0 ? 'text-emerald-400' : 'text-rose-400'}
+        />
+
+        {/* Margen */}
+        <KpiTopCard
+          title="Margen (%)"
+          actual={fmtPct(margen)}
+          anterior={(() => {
+            const margenAnt = kpi.ingresos_anterior > 0
+              ? ((kpi.ingresos_anterior - kpi.egresos_anterior) / kpi.ingresos_anterior) * 100
+              : 0;
+            return fmtPct(margenAnt);
+          })()}
+          actualLabel="Mes actual (%)"
+          anteriorLabel={isYearly ? 'Año anterior' : 'Mes anterior'}
+          badge={margen >= 20
+            ? { text: `+${(margen).toFixed(1)}%`, cls: 'text-emerald-400' }
+            : margen >= 0
+            ? { text: `${margen.toFixed(1)}%`, cls: 'text-amber-400' }
+            : { text: `${margen.toFixed(1)}%`, cls: 'text-rose-400' }
+          }
+          valueCls={margen >= 20 ? 'text-emerald-400' : margen >= 0 ? 'text-amber-400' : 'text-rose-400'}
+          alignRight
+        />
+
+      </section>
+
+      {/* ══ FILA 2: DONUT | TENDENCIA | DONUT ═══════════════════════════════ */}
+      <section className="grid grid-cols-1 md:grid-cols-[minmax(220px,1fr)_minmax(0,2fr)_minmax(220px,1fr)] gap-3 mb-4">
+
+        {/* Donut izquierdo — Ingresos por línea */}
+        <div className="card rounded-2xl p-4">
+          <p className="text-xs text-slate-400 uppercase tracking-widest mb-1">Ingresos por línea de negocio</p>
+          <EChartDonut title="Ingresos" data={ingresos} height="300px" />
+        </div>
+
+        {/* Gráfico central — Tendencia barras + línea */}
+        <div className="card rounded-2xl p-4">
+          <div className="flex items-start justify-between mb-1">
+            <div>
+              <p className="text-xs text-slate-400 uppercase tracking-widest">
+                Tendencia ingresos, gastos y resultados
+              </p>
+              <p className="text-xs text-slate-600 mt-0.5">
+                {selYear === 0 ? 'Todos los períodos' : `Año ${selYear}`} ·
+                <span className="text-emerald-500"> ▌ Ingresos</span>
+                <span className="text-rose-500"> ▌ Egresos</span>
+                <span className="text-amber-400"> ─ Resultado</span>
+              </p>
+            </div>
+          </div>
+          <TrendChart data={trend} height="300px" />
+        </div>
+
+        {/* Donut derecho — Composición de gastos */}
+        <div className="card rounded-2xl p-4">
+          <p className="text-xs text-slate-400 uppercase tracking-widest mb-1">Composición de gastos</p>
+          <EChartDonut title="Gastos" data={egresos} height="300px" />
+        </div>
+
+      </section>
+
+      {/* ══ FILA 3: 4 TARJETAS INFERIORES ══════════════════════════════════ */}
+      <section className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3 mb-4">
+
+        {/* Punto de equilibrio */}
+        <div className="card rounded-2xl p-4">
+          <p className="text-xs text-slate-400 uppercase tracking-widest mb-2">Punto de equilibrio</p>
+          <p className="text-xl font-bold text-white tabular-nums">{fmt(breakeven)}</p>
+          <p className="text-xs text-slate-500 mt-1">
+            Ingresos necesarios para cubrir egresos
+          </p>
+          <div className="mt-2">
+            <span className={`text-xs font-semibold px-2 py-0.5 rounded-md ${
+              breakevenReached
+                ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                : 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
+            }`}>
+              {breakevenReached ? '✓ Alcanzado' : '✗ No alcanzado'}
             </span>
           </div>
-          <p className="text-xs text-slate-500 mt-2">cicsa_charge_areas · COALESCE(invoice_date, created_at)</p>
+          <p className="text-xs text-slate-600 mt-2">
+            Mes previo (S./) {fmt(kpi.egresos_anterior)}
+          </p>
         </div>
 
-        {/* Egresos */}
-        <div id="cardEgresos" className="card rounded-2xl p-5">
-          <p className="text-xs text-slate-400 uppercase tracking-widest mb-1">Egresos del mes</p>
-          <p className="text-3xl font-bold text-rose-400">{fmt(kpi.egresos_actual)}</p>
-          <div className="flex items-center gap-2 mt-2">
-            <span className={`text-sm font-bold ${egV.cls}`}>{egV.text}</span>
-            <span className="text-xs text-slate-500">
-              {vsLabel} (<span className="text-slate-400">{isTodos ? 'total' : fmt(kpi.egresos_anterior)}</span>)
-            </span>
-          </div>
-          <p className="text-xs text-slate-500 mt-2">general_expenses · COALESCE(operation_date, created_at)</p>
+        {/* Alerta ejecutiva */}
+        <div className={`card rounded-2xl p-4 border-l-4 ${
+          resultado >= 0 ? 'border-l-emerald-500' : 'border-l-rose-500'
+        }`}>
+          <p className="text-xs text-slate-400 uppercase tracking-widest mb-2">Alerta ejecutiva del mes</p>
+          <p className={`text-xl font-bold tabular-nums ${resultado >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+            {fmt(Math.abs(resultado))}
+          </p>
+          <p className={`text-xs mt-1 font-semibold ${resultado >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+            {resultado >= 0 ? '✓ Superávit del período' : '⚠ Déficit del período'}
+          </p>
+          <p className="text-xs text-slate-500 mt-2">
+            Mes previo (S./) {fmt(Math.abs(kpi.ingresos_anterior - kpi.egresos_anterior))}&nbsp;
+            <span className={ingV.cls}>{ingV.text}</span>
+          </p>
+          {mqttCount > 0 && (
+            <p className="text-xs text-slate-600 mt-1">{mqttCount} actualiz. MQTT recibidas</p>
+          )}
         </div>
+
+        {/* Top gasto del período */}
+        <div className="card rounded-2xl p-4">
+          <p className="text-xs text-slate-400 uppercase tracking-widest mb-2">Mayor gasto del período</p>
+          {topGasto ? (
+            <>
+              <p className="text-xl font-bold text-white tabular-nums">{fmt(topGasto.value)}</p>
+              <p className="text-xs text-slate-300 mt-1 truncate font-medium">{topGasto.label}</p>
+              <p className="text-xs text-slate-500 mt-1">
+                {kpi.egresos_actual > 0
+                  ? `${((topGasto.value / kpi.egresos_actual) * 100).toFixed(1)}% del total de gastos`
+                  : 'Sin datos de egresos'}
+              </p>
+              {egresos[1] && (
+                <p className="text-xs text-slate-600 mt-2 truncate">
+                  2° <span className="text-slate-400">{egresos[1].label}</span>
+                  {' · '}{fmt(egresos[1].value)}
+                </p>
+              )}
+            </>
+          ) : (
+            <p className="text-sm text-slate-500 mt-2">Sin datos</p>
+          )}
+        </div>
+
+        {/* Ratio Gasto / Ingreso */}
+        <div className="card rounded-2xl p-4">
+          <p className="text-xs text-slate-400 uppercase tracking-widest mb-2">Ratio Gasto / Ingreso (%)</p>
+          <div className="grid grid-cols-3 items-end gap-2">
+            <div>
+              <p className={`text-xl font-bold tabular-nums ${ratioCls}`}>{fmtPct(ratio)}</p>
+              <p className="text-xs text-slate-500 mt-1">Mes actual</p>
+            </div>
+            <div>
+              <p className="text-xl font-semibold tabular-nums text-slate-300">
+                {kpi.ingresos_anterior > 0
+                  ? fmtPct((kpi.egresos_anterior / kpi.ingresos_anterior) * 100)
+                  : '—'}
+              </p>
+              <p className="text-xs text-slate-500 mt-1">{isYearly ? 'Año ant.' : 'Mes ant.'}</p>
+            </div>
+            <div className="flex flex-col items-center">
+              <span className={`text-xs font-bold px-2 py-1 rounded-lg ${
+                ratio <= 80
+                  ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                  : ratio <= 100
+                  ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
+                  : 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
+              }`}>
+                {ratio <= 80 ? '✓ OK' : ratio <= 100 ? '⚠ Alto' : '✗ Crítico'}
+              </span>
+              <p className="text-xs text-slate-500 mt-1">Estado</p>
+            </div>
+          </div>
+          <p className="text-xs text-slate-600 mt-2">{ratioLabel} · Ideal &lt; 80%</p>
+        </div>
+
       </section>
 
-      {/* ── FILA 2: Resultado / Margen ── */}
-      <section className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
-        {/* Resultado neto */}
-        <div id="cardResultado" className="card rounded-2xl p-5">
-          <p className="text-xs text-slate-400 uppercase tracking-widest mb-1">Resultado neto</p>
-          <p className={`text-3xl font-bold ${resultado >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-            {fmt(resultado)}
-          </p>
-          <p className="text-xs text-slate-500 mt-1">{resultado >= 0 ? '✓ Superávit' : '⚠ Déficit'}</p>
-          <div className="bar-track mt-3">
-            <div className={`bar-fill ${resultadoBarCls}`} style={{ width: `${barResultadoPct}%` }} />
-          </div>
-          <div className="flex justify-between text-xs text-slate-600 mt-1">
-            <span>Egresos</span><span>Ingresos</span>
-          </div>
-        </div>
-
-        {/* Margen bruto */}
-        <div id="cardMargen" className="card rounded-2xl p-5">
-          <p className="text-xs text-slate-400 uppercase tracking-widest mb-1">Margen bruto</p>
-          <p className={`text-3xl font-bold ${margen >= 20 ? 'text-emerald-400' : margen >= 0 ? 'text-amber-400' : 'text-rose-400'}`}>
-            {fmtPct(margen)}
-          </p>
-          <p className="text-xs text-slate-500 mt-1">Resultado / Ingresos × 100</p>
-          <div className="bar-track mt-3">
-            <div className={`bar-fill ${margenBarCls}`} style={{ width: `${Math.max(0, Math.min(margen, 100))}%` }} />
-          </div>
-        </div>
-      </section>
-
-      {/* ── FILA 3: Período / Ratio ── */}
-      <section className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
-        {/* Período info */}
-        <div className="card rounded-2xl p-5">
-          <p className="text-xs text-slate-400 uppercase tracking-widest mb-3">Período seleccionado</p>
-          <p className="text-lg font-semibold text-white">{periodoStr}</p>
-          <p className="text-xs text-slate-500 mt-1">
-            Última actualización: <span className="text-slate-300">{lastUpdate}</span>
-          </p>
-          <p className="text-xs text-slate-500 mt-1">
-            Mensajes MQTT recibidos: <span className="text-slate-300">{mqttCount}</span>
-          </p>
-        </div>
-
-        {/* Ratio gasto/ingreso */}
-        <div className="card rounded-2xl p-5">
-          <p className="text-xs text-slate-400 uppercase tracking-widest mb-3">Ratio Gasto / Ingreso</p>
-          <p className={`text-3xl font-bold ${ratio <= 80 ? 'text-emerald-400' : ratio <= 100 ? 'text-amber-400' : 'text-rose-400'}`}>
-            {fmtPct(ratio)}
-          </p>
-          <p className={`text-xs mt-1 ${ratio <= 80 ? 'text-emerald-400' : ratio <= 100 ? 'text-amber-400' : 'text-rose-400'}`}>
-            {ratio <= 80 ? '✓ Eficiencia saludable' : ratio <= 100 ? '⚠ Atención requerida' : '✗ Gastos superan ingresos'}
-          </p>
-          <div className="bar-track mt-3">
-            <div className={`bar-fill ${ratioBarCls}`} style={{ width: `${Math.min(ratio, 100)}%` }} />
-          </div>
-          <p className="text-xs text-slate-600 mt-1">Ideal: menos de 80%</p>
-        </div>
-      </section>
-
-      {/* ── FILA 4: Gráficas donut ── */}
-      <section className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
-        <div className="card rounded-2xl p-5">
-          <p className="text-xs text-slate-400 uppercase tracking-widest mb-3">Ingresos por línea de negocio</p>
-          <EChartDonut title="Ingresos por Línea" data={ingresos} />
-        </div>
-        <div className="card rounded-2xl p-5">
-          <p className="text-xs text-slate-400 uppercase tracking-widest mb-3">Composición de gastos</p>
-          <EChartDonut title="Composición de Gastos" data={egresos} />
-        </div>
-      </section>
-
-      {/* ── FOOTER ── */}
-      <footer className="text-xs text-slate-600 text-center mt-4">
-        GO-SERVICE · {periodoStr} · MQTT: ccip/dashboard
+      {/* ══ FOOTER ══════════════════════════════════════════════════════════ */}
+      <footer className="text-xs text-slate-600 text-center py-2">
+        GO-SERVICE · {periodoStr} · MQTT: ccip/dashboard · {lastUpdate}
       </footer>
+
     </div>
   );
 }

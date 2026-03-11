@@ -28,6 +28,15 @@ export interface Period {
   month: number;
 }
 
+/** Un punto de tendencia mensual para el gráfico central */
+export interface TrendPoint {
+  year:      number;
+  month:     number;
+  ingresos:  number;
+  egresos:   number;
+  resultado: number;
+}
+
 export const dashboardApi = {
   getKPIs: (year: number, month: number) =>
     axios.get<KpiResponse>(`${API_BASE_URL}/api/kpis?year=${year}&month=${month}`),
@@ -37,5 +46,10 @@ export const dashboardApi = {
 
   getPeriods: () =>
     axios.get<Period[]>(`${API_BASE_URL}/api/kpis/periods`),
+
+  /** Tendencia mensual para el gráfico de barras+línea.
+   *  Si year=0 devuelve todos. Si month=0 devuelve todos los meses del año. */
+  getTrend: (year: number) =>
+    axios.get<TrendPoint[]>(`${API_BASE_URL}/api/kpis/trend?year=${year}`),
 };
 
